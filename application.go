@@ -340,22 +340,19 @@ func GeneratePDF(app Applications) (string, error) {
 	return pdfPath, nil
 }
 func SendEmail(app Applications, pdfPath string) error {
-	apiKey := os.Getenv("RESEND_API_KEY")
-	admin := os.Getenv("ADMIN_EMAIL")
-	from := os.Getenv("FROM_EMAIL")
+	apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY"))
+	admin := strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))
+	from := strings.TrimSpace(os.Getenv("FROM_EMAIL"))
 
-	// If email is not configured, skip sending in local/dev environments
-	if strings.TrimSpace(apiKey) == "" || strings.TrimSpace(admin) == "" {
-		log.Printf("email not configured (RESEND_API_KEY or ADMIN_EMAIL missing); skipping send in dev")
-		return nil
+	if apiKey == "" || admin == "" || from == "" {
+		return fmt.Errorf("email configuration is incomplete: RESEND_API_KEY, ADMIN_EMAIL, and FROM_EMAIL must be set")
 	}
 
-	if strings.TrimSpace(from) == "" {
-		from = "Startup Portal <onboarding@resend.dev>"
+	if !strings.Contains(from, "<") && strings.Contains(from, "@") {
+		from = fmt.Sprintf("Startup Portal <%s>", from)
 	}
 
-	// Debug: log whether env vars are present (do not print actual API key)
-	log.Printf("SendEmail: apiKey set=%v, admin=%q, from=%q", strings.TrimSpace(apiKey) != "", admin, from)
+	log.Printf("SendEmail: apiKey set=%v, admin=%q, from=%q", apiKey != "", admin, from)
 
 	pdfBytes, err := os.ReadFile(pdfPath)
 	if err != nil {
@@ -394,9 +391,8 @@ func SendEmail(app Applications, pdfPath string) error {
 
 		if resp.StatusCode == 403 {
 			log.Printf("resend 403 response: %s", bodyStr)
-			if strings.Contains(bodyStr, "testing emails") {
-				log.Printf("resend returned testing-mode restriction, skipping email send: %s", bodyStr)
-				return nil
+			if strings.Contains(bodyStr, "domain is not verified") || strings.Contains(bodyStr, "testing emails") {
+				return fmt.Errorf("email configuration is incomplete: %s", bodyStr)
 			}
 			return fmt.Errorf("resend 403 forbidden: %s", bodyStr)
 		}
