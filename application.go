@@ -342,6 +342,7 @@ func GeneratePDF(app Applications) (string, error) {
 func SendEmail(app Applications, pdfPath string) error {
 	apiKey := os.Getenv("RESEND_API_KEY")
 	admin := os.Getenv("ADMIN_EMAIL")
+	from := os.Getenv("FROM_EMAIL")
 
 	// If email is not configured, skip sending in local/dev environments
 	if strings.TrimSpace(apiKey) == "" || strings.TrimSpace(admin) == "" {
@@ -349,8 +350,12 @@ func SendEmail(app Applications, pdfPath string) error {
 		return nil
 	}
 
+	if strings.TrimSpace(from) == "" {
+		from = "Startup Portal <onboarding@resend.dev>"
+	}
+
 	// Debug: log whether env vars are present (do not print actual API key)
-	log.Printf("SendEmail: apiKey set=%v, admin set=%v", strings.TrimSpace(apiKey) != "", strings.TrimSpace(admin) != "")
+	log.Printf("SendEmail: apiKey set=%v, admin=%q, from=%q", strings.TrimSpace(apiKey) != "", admin, from)
 
 	pdfBytes, err := os.ReadFile(pdfPath)
 	if err != nil {
@@ -363,7 +368,7 @@ func SendEmail(app Applications, pdfPath string) error {
 	)
 
 	payload := map[string]any{
-		"from":    "Startup Portal <onboarding@resend.dev>",
+		"from":    from,
 		"to":      []string{admin},
 		"subject": "New Startup Application",
 		"text":    body,
@@ -387,10 +392,13 @@ func SendEmail(app Applications, pdfPath string) error {
 		b, _ := io.ReadAll(resp.Body)
 		bodyStr := string(b)
 
-		// Treat Resend "testing emails" 403 validation error as non-fatal in dev
-		if resp.StatusCode == 403 && strings.Contains(bodyStr, "testing emails") {
-			log.Printf("resend returned testing-mode restriction, skipping email send: %s", bodyStr)
-			return nil
+		if resp.StatusCode == 403 {
+			log.Printf("resend 403 response: %s", bodyStr)
+			if strings.Contains(bodyStr, "testing emails") {
+				log.Printf("resend returned testing-mode restriction, skipping email send: %s", bodyStr)
+				return nil
+			}
+			return fmt.Errorf("resend 403 forbidden: %s", bodyStr)
 		}
 
 		return fmt.Errorf("resend error (%d): %s", resp.StatusCode, bodyStr)
