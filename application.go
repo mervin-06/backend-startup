@@ -24,9 +24,6 @@ type Applications struct {
 	Track       string   `json:"track"`
 	Sector      string   `json:"sector"`
 	Description string   `json:"description"`
-	InputOne    string   `json:"inputOne"`
-	InputTwo    string   `json:"inputTwo"`
-	InputThree  string   `json:"inputThree"`
 }
 
 type Response struct {
@@ -145,9 +142,6 @@ func validateApplication(app Applications) error {
 		strings.TrimSpace(app.Track) == "" ||
 		strings.TrimSpace(app.Sector) == "" ||
 		strings.TrimSpace(app.Description) == "" ||
-		strings.TrimSpace(app.InputOne) == "" ||
-		strings.TrimSpace(app.InputTwo) == "" ||
-		strings.TrimSpace(app.InputThree) == "" ||
 		len(app.Teams) != 3 {
 		return fmt.Errorf("all application fields are required")
 	}
@@ -280,24 +274,6 @@ func GeneratePDF(app Applications) (string, error) {
 	pdf.MultiCell(145, 8, app.Description, "", "L", false)
 	pdf.Ln(6)
 
-	pdf.SetFont("Arial", "B", 12)
-	pdf.Cell(45, 8, "Detail 1")
-	pdf.SetFont("Arial", "", 12)
-	pdf.MultiCell(145, 8, app.InputOne, "", "L", false)
-	pdf.Ln(2)
-
-	pdf.SetFont("Arial", "B", 12)
-	pdf.Cell(45, 8, "Detail 2")
-	pdf.SetFont("Arial", "", 12)
-	pdf.MultiCell(145, 8, app.InputTwo, "", "L", false)
-	pdf.Ln(2)
-
-	pdf.SetFont("Arial", "B", 12)
-	pdf.Cell(45, 8, "Detail 3")
-	pdf.SetFont("Arial", "", 12)
-	pdf.MultiCell(145, 8, app.InputThree, "", "L", false)
-	pdf.Ln(6)
-
 	// =========================
 	// TEAM MEMBERS
 	// =========================
@@ -388,20 +364,64 @@ func GeneratePDF(app Applications) (string, error) {
 
 	return pdfPath, nil
 }
+
+const resendSandboxFrom = "onboarding@resend.dev"
+
+func resolveFromAddress(from string) string {
+	from = strings.TrimSpace(from)
+	if from == "" {
+		return resendSandboxFrom
+	}
+
+	if strings.Contains(from, "<") || !strings.Contains(from, "@") {
+		return resendSandboxFrom
+	}
+
+	return fmt.Sprintf("Startup Portal <%s>", from)
+}
+
+func parseRecipients(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
+	})
+
+	var recipients []string
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		recipients = append(recipients, trimmed)
+	}
+
+	return recipients
+}
+
 func SendEmail(app Applications, pdfPath string) error {
 	apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY"))
 	admin := strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))
 	from := strings.TrimSpace(os.Getenv("FROM_EMAIL"))
 
-	if apiKey == "" || admin == "" || from == "" {
-		return fmt.Errorf("email configuration is incomplete: RESEND_API_KEY, ADMIN_EMAIL, and FROM_EMAIL must be set")
+	if apiKey == "" {
+		return fmt.Errorf("email configuration is incomplete: RESEND_API_KEY must be set")
 	}
 
-	if !strings.Contains(from, "<") && strings.Contains(from, "@") {
-		from = fmt.Sprintf("Startup Portal <%s>", from)
+	if strings.TrimSpace(admin) == "" {
+		return fmt.Errorf("email configuration is incomplete: ADMIN_EMAIL must be set")
 	}
 
-	log.Printf("SendEmail: apiKey set=%v, admin=%q, from=%q", apiKey != "", admin, from)
+	from = resolveFromAddress(from)
+	adminRecipients := parseRecipients(admin)
+	if len(adminRecipients) == 0 {
+		return fmt.Errorf("email configuration is incomplete: ADMIN_EMAIL must be set")
+	}
+
+	log.Printf("SendEmail: apiKey set=%v, recipients=%q, from=%q", apiKey != "", adminRecipients, from)
 
 	pdfBytes, err := os.ReadFile(pdfPath)
 	if err != nil {
@@ -409,13 +429,13 @@ func SendEmail(app Applications, pdfPath string) error {
 	}
 
 	body := fmt.Sprintf(
-		"A new startup application has been submitted.\n\nLeader: %s\nEmail: %s\nPhone: %s\nIdea: %s\nDescription: %s\nDetail 1: %s\nDetail 2: %s\nDetail 3: %s",
-		app.Leader, app.Email, app.Phone, app.Idea, app.Description, app.InputOne, app.InputTwo, app.InputThree,
+		"A new startup application has been submitted.\n\nLeader: %s\nEmail: %s\nPhone: %s\nIdea: %s\nDescription: %s",
+		app.Leader, app.Email, app.Phone, app.Idea, app.Description,
 	)
 
 	payload := map[string]any{
 		"from":    from,
-		"to":      []string{admin},
+		"to":      adminRecipients,
 		"subject": "New Startup Application",
 		"text":    body,
 		"attachments": []map[string]string{
@@ -441,6 +461,26 @@ func SendEmail(app Applications, pdfPath string) error {
 		if resp.StatusCode == 403 {
 			log.Printf("resend 403 response: %s", bodyStr)
 			if strings.Contains(bodyStr, "domain is not verified") || strings.Contains(bodyStr, "testing emails") {
+				if from != resendSandboxFrom {
+					log.Printf("retrying email with default resend sender %q", resendSandboxFrom)
+					payload["from"] = resendSandboxFrom
+					reqBody, _ = json.Marshal(payload)
+					req, _ = http.NewRequest(http.MethodPost, "https://api.resend.com/emails", bytes.NewReader(reqBody))
+					req.Header.Set("Authorization", "Bearer "+apiKey)
+					req.Header.Set("Content-Type", "application/json")
+
+					resp, err = http.DefaultClient.Do(req)
+					if err != nil {
+						return fmt.Errorf("send request after fallback: %w", err)
+					}
+					defer resp.Body.Close()
+
+					if resp.StatusCode >= 300 {
+						b, _ = io.ReadAll(resp.Body)
+						return fmt.Errorf("email configuration is incomplete: %s", string(b))
+					}
+					return nil
+				}
 				return fmt.Errorf("email configuration is incomplete: %s", bodyStr)
 			}
 			return fmt.Errorf("resend 403 forbidden: %s", bodyStr)
