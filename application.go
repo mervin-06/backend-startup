@@ -15,14 +15,18 @@ import (
 )
 
 type Applications struct {
-	Idea       string   `json:"idea"`
-	Leader     string   `json:"leader"`
-	Email      string   `json:"email"`
-	Phone      string   `json:"phone"`
-	Department string   `json:"department"`
-	Teams      []string `json:"teams"`
-	Track      string   `json:"track"`
-	Sector     string   `json:"sector"`
+	Idea        string   `json:"idea"`
+	Leader      string   `json:"leader"`
+	Email       string   `json:"email"`
+	Phone       string   `json:"phone"`
+	Department  string   `json:"department"`
+	Teams       []string `json:"teams"`
+	Track       string   `json:"track"`
+	Sector      string   `json:"sector"`
+	Description string   `json:"description"`
+	InputOne    string   `json:"inputOne"`
+	InputTwo    string   `json:"inputTwo"`
+	InputThree  string   `json:"inputThree"`
 }
 
 type Response struct {
@@ -79,18 +83,10 @@ func Application(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields
-	if strings.TrimSpace(app.Idea) == "" ||
-		strings.TrimSpace(app.Leader) == "" ||
-		strings.TrimSpace(app.Email) == "" ||
-		strings.TrimSpace(app.Phone) == "" ||
-		strings.TrimSpace(app.Department) == "" ||
-		strings.TrimSpace(app.Track) == "" ||
-		strings.TrimSpace(app.Sector) == "" {
-
+	if err := validateApplication(app); err != nil {
 		writeJSON(w, http.StatusBadRequest, Response{
 			Status:  "error",
-			Message: "all application fields are required",
+			Message: err.Error(),
 		})
 		return
 	}
@@ -138,6 +134,35 @@ func Application(w http.ResponseWriter, r *http.Request) {
 		Status:  "success",
 		Message: "application submitted successfully",
 	})
+}
+
+func validateApplication(app Applications) error {
+	if strings.TrimSpace(app.Idea) == "" ||
+		strings.TrimSpace(app.Leader) == "" ||
+		strings.TrimSpace(app.Email) == "" ||
+		strings.TrimSpace(app.Phone) == "" ||
+		strings.TrimSpace(app.Department) == "" ||
+		strings.TrimSpace(app.Track) == "" ||
+		strings.TrimSpace(app.Sector) == "" ||
+		strings.TrimSpace(app.Description) == "" ||
+		strings.TrimSpace(app.InputOne) == "" ||
+		strings.TrimSpace(app.InputTwo) == "" ||
+		strings.TrimSpace(app.InputThree) == "" ||
+		len(app.Teams) != 3 {
+		return fmt.Errorf("all application fields are required")
+	}
+
+	for _, member := range app.Teams {
+		if strings.TrimSpace(member) == "" {
+			return fmt.Errorf("three team member names are required")
+		}
+	}
+
+	if wordCount(app.Description) > 150 {
+		return fmt.Errorf("description must be 150 words or fewer")
+	}
+
+	return nil
 }
 
 func GeneratePDF(app Applications) (string, error) {
@@ -247,7 +272,31 @@ func GeneratePDF(app Applications) (string, error) {
 
 	pdf.Cell(45, 8, "Sector")
 	pdf.Cell(0, 8, app.Sector)
-	pdf.Ln(12)
+	pdf.Ln(10)
+
+	pdf.SetFont("Arial", "B", 12)
+	pdf.Cell(45, 8, "Description")
+	pdf.SetFont("Arial", "", 12)
+	pdf.MultiCell(145, 8, app.Description, "", "L", false)
+	pdf.Ln(6)
+
+	pdf.SetFont("Arial", "B", 12)
+	pdf.Cell(45, 8, "Detail 1")
+	pdf.SetFont("Arial", "", 12)
+	pdf.MultiCell(145, 8, app.InputOne, "", "L", false)
+	pdf.Ln(2)
+
+	pdf.SetFont("Arial", "B", 12)
+	pdf.Cell(45, 8, "Detail 2")
+	pdf.SetFont("Arial", "", 12)
+	pdf.MultiCell(145, 8, app.InputTwo, "", "L", false)
+	pdf.Ln(2)
+
+	pdf.SetFont("Arial", "B", 12)
+	pdf.Cell(45, 8, "Detail 3")
+	pdf.SetFont("Arial", "", 12)
+	pdf.MultiCell(145, 8, app.InputThree, "", "L", false)
+	pdf.Ln(6)
 
 	// =========================
 	// TEAM MEMBERS
@@ -360,8 +409,8 @@ func SendEmail(app Applications, pdfPath string) error {
 	}
 
 	body := fmt.Sprintf(
-		"A new startup application has been submitted.\n\nLeader: %s\nEmail: %s\nPhone: %s\nIdea: %s",
-		app.Leader, app.Email, app.Phone, app.Idea,
+		"A new startup application has been submitted.\n\nLeader: %s\nEmail: %s\nPhone: %s\nIdea: %s\nDescription: %s\nDetail 1: %s\nDetail 2: %s\nDetail 3: %s",
+		app.Leader, app.Email, app.Phone, app.Idea, app.Description, app.InputOne, app.InputTwo, app.InputThree,
 	)
 
 	payload := map[string]any{
@@ -400,6 +449,10 @@ func SendEmail(app Applications, pdfPath string) error {
 		return fmt.Errorf("resend error (%d): %s", resp.StatusCode, bodyStr)
 	}
 	return nil
+}
+
+func wordCount(value string) int {
+	return len(strings.Fields(value))
 }
 
 func isEmailConfigurationError(err error) bool {
