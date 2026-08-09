@@ -445,16 +445,31 @@ func SendEmail(app Applications, pdfPath string) error {
 	subject := "New Startup Application"
 
 	apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY"))
-	if apiKey != "" {
-		return sendEmailWithResend(apiKey, from, adminRecipients, subject, body, pdfBytes)
-	}
-
 	smtpHost := strings.TrimSpace(os.Getenv("SMTP_HOST"))
 	smtpPort := strings.TrimSpace(os.Getenv("SMTP_PORT"))
 	smtpUser := strings.TrimSpace(os.Getenv("SMTP_USER"))
 	smtpPass := strings.TrimSpace(os.Getenv("SMTP_PASS"))
+	smtpConfigured := smtpHost != "" && smtpPort != "" && smtpUser != "" && smtpPass != ""
 
-	if smtpHost != "" && smtpPort != "" && smtpUser != "" && smtpPass != "" {
+	if apiKey != "" {
+		err = sendEmailWithResend(apiKey, from, adminRecipients, subject, body, pdfBytes)
+		if err == nil {
+			return nil
+		}
+
+		if smtpConfigured {
+			log.Printf("Resend failed, attempting SMTP fallback: %v", err)
+			smtpErr := sendEmailWithSMTP(smtpHost, smtpPort, smtpUser, smtpPass, from, adminRecipients, subject, body, pdfPath)
+			if smtpErr == nil {
+				return nil
+			}
+			return fmt.Errorf("resend failed: %w; smtp fallback failed: %v", err, smtpErr)
+		}
+
+		return err
+	}
+
+	if smtpConfigured {
 		return sendEmailWithSMTP(smtpHost, smtpPort, smtpUser, smtpPass, from, adminRecipients, subject, body, pdfPath)
 	}
 
