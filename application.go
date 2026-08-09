@@ -9,9 +9,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/jung-kurt/gofpdf"
+	"gopkg.in/gomail.v2"
 )
 
 type Applications struct {
@@ -380,6 +382,23 @@ func resolveFromAddress(from string) string {
 	return fmt.Sprintf("Startup Portal <%s>", from)
 }
 
+func resolveSMTPFromAddress(from, smtpUser string) string {
+	from = strings.TrimSpace(from)
+	if from != "" && strings.Contains(from, "@") {
+		if strings.Contains(from, "<") {
+			return from
+		}
+		return fmt.Sprintf("Startup Portal <%s>", from)
+	}
+
+	smtpUser = strings.TrimSpace(smtpUser)
+	if smtpUser != "" && strings.Contains(smtpUser, "@") {
+		return smtpUser
+	}
+
+	return ""
+}
+
 func parseRecipients(value string) []string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -403,25 +422,15 @@ func parseRecipients(value string) []string {
 }
 
 func SendEmail(app Applications, pdfPath string) error {
-	apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY"))
 	admin := strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))
 	from := strings.TrimSpace(os.Getenv("FROM_EMAIL"))
 
-	if apiKey == "" {
-		return fmt.Errorf("email configuration is incomplete: RESEND_API_KEY must be set")
-	}
-
-	if strings.TrimSpace(admin) == "" {
-		return fmt.Errorf("email configuration is incomplete: ADMIN_EMAIL must be set")
-	}
-
-	from = resolveFromAddress(from)
 	adminRecipients := parseRecipients(admin)
 	if len(adminRecipients) == 0 {
 		return fmt.Errorf("email configuration is incomplete: ADMIN_EMAIL must be set")
 	}
 
-	log.Printf("SendEmail: apiKey set=%v, recipients=%q, from=%q", apiKey != "", adminRecipients, from)
+	log.Printf("SendEmail: admin=%q, from=%q", adminRecipients, from)
 
 	pdfBytes, err := os.ReadFile(pdfPath)
 	if err != nil {
@@ -433,10 +442,34 @@ func SendEmail(app Applications, pdfPath string) error {
 		app.Leader, app.Email, app.Phone, app.Idea, app.Description,
 	)
 
+	subject := "New Startup Application"
+
+	apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY"))
+	if apiKey != "" {
+		return sendEmailWithResend(apiKey, from, adminRecipients, subject, body, pdfBytes)
+	}
+
+	smtpHost := strings.TrimSpace(os.Getenv("SMTP_HOST"))
+	smtpPort := strings.TrimSpace(os.Getenv("SMTP_PORT"))
+	smtpUser := strings.TrimSpace(os.Getenv("SMTP_USER"))
+	smtpPass := strings.TrimSpace(os.Getenv("SMTP_PASS"))
+
+	if smtpHost != "" && smtpPort != "" && smtpUser != "" && smtpPass != "" {
+		return sendEmailWithSMTP(smtpHost, smtpPort, smtpUser, smtpPass, from, adminRecipients, subject, body, pdfPath)
+	}
+
+	return fmt.Errorf("email configuration is incomplete: RESEND_API_KEY or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS must be set")
+}
+
+func sendEmailWithResend(apiKey, from string, recipients []string, subject, body string, pdfBytes []byte) error {
+	if from = resolveFromAddress(from); from == "" {
+		from = resendSandboxFrom
+	}
+
 	payload := map[string]any{
 		"from":    from,
-		"to":      adminRecipients,
-		"subject": "New Startup Application",
+		"to":      recipients,
+		"subject": subject,
 		"text":    body,
 		"attachments": []map[string]string{
 			{"filename": "application.pdf", "content": base64.StdEncoding.EncodeToString(pdfBytes)},
@@ -488,6 +521,33 @@ func SendEmail(app Applications, pdfPath string) error {
 
 		return fmt.Errorf("resend error (%d): %s", resp.StatusCode, bodyStr)
 	}
+
+	return nil
+}
+
+func sendEmailWithSMTP(host, port, user, pass, from string, recipients []string, subject, body string, pdfPath string) error {
+	fromAddress := resolveSMTPFromAddress(from, user)
+	if fromAddress == "" {
+		fromAddress = "Startup Portal <no-reply@startup-portal.local>"
+	}
+
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("invalid SMTP_PORT: %w", err)
+	}
+
+	message := gomail.NewMessage()
+	message.SetHeader("From", fromAddress)
+	message.SetHeader("To", recipients...)
+	message.SetHeader("Subject", subject)
+	message.SetBody("text/plain", body)
+	message.Attach(pdfPath)
+
+	dialer := gomail.NewDialer(host, portNum, user, pass)
+	if err := dialer.DialAndSend(message); err != nil {
+		return fmt.Errorf("send email over SMTP: %w", err)
+	}
+
 	return nil
 }
 
@@ -496,13 +556,9 @@ func wordCount(value string) int {
 }
 
 func isEmailConfigurationError(err error) bool {
-
 	if err == nil {
 		return false
 	}
 
-	return strings.Contains(
-		err.Error(),
-		"email configuration is incomplete",
-	)
+	return strings.Contains(err.Error(), "email configuration is incomplete")
 }
