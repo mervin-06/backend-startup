@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"testing"
 )
 
@@ -50,16 +49,5 @@ func TestIsAllowedOriginAllowsLocalhostAndLoopback(t *testing.T) {
 				)
 			}
 		})
-	}
-}
-
-func TestIsEmailConfigurationError(t *testing.T) {
-
-	err := errors.New(
-		"email configuration is incomplete: EMAIL, APP, and ADMIN must be set",
-	)
-
-	if !isEmailConfigurationError(err) {
-		t.Fatalf("expected configuration error to be recognized")
 	}
 }

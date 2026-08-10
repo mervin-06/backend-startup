@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,11 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/option"
+	"google.golang.org/api/sheets/v4"
 )
 
 type Applications struct {
@@ -26,6 +32,8 @@ type Applications struct {
 	Track       string   `json:"track"`
 	Sector      string   `json:"sector"`
 	Description string   `json:"description"`
+	SubmittedAt string   `json:"submittedAt,omitempty"`
+	PDFLink     string   `json:"pdfLink,omitempty"`
 }
 
 type apiResponse struct {
@@ -36,8 +44,6 @@ type apiResponse struct {
 const (
 	maxUploadSize = 10 << 20 // 10 MB
 	maxMemory     = 8 << 20  // 8 MB in memory for multipart form parsing
-	resendAPIURL  = "https://api.resend.com/emails"
-	defaultFrom   = "Startup Portal <onboarding@resend.dev>"
 )
 
 func writeJSON(w http.ResponseWriter, status int, response apiResponse) {
@@ -87,18 +93,15 @@ func Application(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := SendEmail(app, pdfBytes); err != nil {
-		log.Printf("send email: %v", err)
-		if isEmailConfigurationError(err) {
-			writeJSON(w, http.StatusInternalServerError, apiResponse{Success: false, Message: "email service is not configured on the server"})
-			return
-		}
+	app.SubmittedAt = time.Now().UTC().Format(time.RFC3339)
 
-		writeJSON(w, http.StatusInternalServerError, apiResponse{Success: false, Message: "Application received but email could not be sent"})
+	if err := uploadApplicationToDrive(r.Context(), app, pdfBytes); err != nil {
+		log.Printf("upload to Google Drive: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Success: false, Message: "failed to save application to Google Drive"})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Application submitted and email sent successfully"})
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Application submitted successfully"})
 }
 
 func parseApplicationRequest(form *multipart.Form) (Applications, []byte, error) {
@@ -199,86 +202,197 @@ func validateApplication(app Applications) error {
 	return nil
 }
 
-func SendEmail(app Applications, pdfBytes []byte) error {
-	adminEmail := strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))
-	if adminEmail == "" {
-		return errors.New("email configuration is incomplete: ADMIN_EMAIL must be set")
+func uploadApplicationToDrive(ctx context.Context, app Applications, pdfBytes []byte) error {
+	driveFolderID := strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_FOLDER_ID"))
+	if driveFolderID == "" {
+		return errors.New("Google Drive configuration is incomplete: GOOGLE_DRIVE_FOLDER_ID must be set")
 	}
 
-	apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY"))
-	if apiKey == "" {
-		return errors.New("email configuration is incomplete: RESEND_API_KEY must be set")
-	}
-
-	from := strings.TrimSpace(os.Getenv("SENDER_EMAIL"))
-	if from == "" || !strings.Contains(from, "@") {
-		from = defaultFrom
-	}
-
-	body := fmt.Sprintf(
-		"A new startup application has been submitted.\n\nVenture/Idea name: %s\nTeam leader: %s\nEmail: %s\nPhone: %s\nDepartment: %s\nTrack: %s\nSector: %s\n\nDescription:\n%s\n\nTeam members:\n%s",
-		app.Idea,
-		app.Leader,
-		app.Email,
-		app.Phone,
-		app.Department,
-		app.Track,
-		app.Sector,
-		app.Description,
-		strings.Join(app.Teams, "\n"),
-	)
-
-	subject := fmt.Sprintf("New Startup Application - %s", app.Idea)
-	return sendEmailWithResend(apiKey, from, adminEmail, subject, body, pdfBytes)
-}
-
-func sendEmailWithResend(apiKey, from, recipient, subject, body string, pdfBytes []byte) error {
-	payload := map[string]any{
-		"from":    from,
-		"to":      []string{recipient},
-		"subject": subject,
-		"text":    body,
-		"attachments": []map[string]string{
-			{"filename": "startup_application.pdf", "content": base64.StdEncoding.EncodeToString(pdfBytes), "type": "application/pdf"},
-		},
-	}
-
-	reqBody, err := json.Marshal(payload)
+	driveService, err := newDriveService(ctx)
 	if err != nil {
-		return fmt.Errorf("marshal resend payload: %w", err)
+		return fmt.Errorf("create Google Drive service: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, resendAPIURL, bytes.NewReader(reqBody))
+	folderName, err := nextApplicationFolderName(ctx, driveService, driveFolderID)
 	if err != nil {
-		return fmt.Errorf("create resend request: %w", err)
+		return fmt.Errorf("determine application folder name: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
+	appFolder, err := createDriveFolder(ctx, driveService, folderName, driveFolderID)
 	if err != nil {
-		return fmt.Errorf("send request: %w", err)
+		return fmt.Errorf("create application folder: %w", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode >= 300 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("resend error (%d): %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	pdfFile, err := uploadDriveFile(ctx, driveService, "application.pdf", "application/pdf", appFolder.Id, bytes.NewReader(pdfBytes))
+	if err != nil {
+		return fmt.Errorf("upload PDF to Drive: %w", err)
+	}
+
+	app.PDFLink = pdfFile.WebViewLink
+
+	jsonBytes, err := json.MarshalIndent(app, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal application JSON: %w", err)
+	}
+
+	if _, err := uploadDriveFile(ctx, driveService, "application.json", "application/json", appFolder.Id, bytes.NewReader(jsonBytes)); err != nil {
+		return fmt.Errorf("upload application JSON to Drive: %w", err)
+	}
+
+	sheetID := strings.TrimSpace(os.Getenv("GOOGLE_SHEET_ID"))
+	if sheetID != "" {
+		sheetsService, err := newSheetsService(ctx)
+		if err != nil {
+			return fmt.Errorf("create Google Sheets service: %w", err)
+		}
+
+		if err := appendApplicationRow(ctx, sheetsService, sheetID, app); err != nil {
+			return fmt.Errorf("append application row to Google Sheets: %w", err)
+		}
 	}
 
 	return nil
 }
 
-func wordCount(value string) int {
-	return len(strings.Fields(value))
-}
-
-func isEmailConfigurationError(err error) bool {
-	if err == nil {
-		return false
+func newGoogleClient(ctx context.Context) (*http.Client, error) {
+	serviceAccountJSON, err := getServiceAccountJSON()
+	if err != nil {
+		return nil, err
 	}
 
-	return strings.Contains(err.Error(), "email configuration is incomplete")
+	config, err := google.JWTConfigFromJSON(serviceAccountJSON,
+		drive.DriveFileScope,
+		drive.DriveMetadataScope,
+		sheets.SpreadsheetsScope,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create service account credentials: %w", err)
+	}
+
+	return config.Client(ctx), nil
+}
+
+func getServiceAccountJSON() ([]byte, error) {
+	if jsonData := strings.TrimSpace(os.Getenv("GOOGLE_SERVICE_ACCOUNT_JSON")); jsonData != "" {
+		return []byte(jsonData), nil
+	}
+
+	if encoded := strings.TrimSpace(os.Getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64")); encoded != "" {
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("decode GOOGLE_SERVICE_ACCOUNT_JSON_BASE64: %w", err)
+		}
+		return decoded, nil
+	}
+
+	return nil, errors.New("Google Drive configuration is incomplete: set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_BASE64")
+}
+
+func newDriveService(ctx context.Context) (*drive.Service, error) {
+	client, err := newGoogleClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return drive.NewService(ctx, option.WithHTTPClient(client))
+}
+
+func newSheetsService(ctx context.Context) (*sheets.Service, error) {
+	client, err := newGoogleClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return sheets.NewService(ctx, option.WithHTTPClient(client))
+}
+
+func nextApplicationFolderName(ctx context.Context, svc *drive.Service, parentFolderID string) (string, error) {
+	query := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and '%s' in parents and trashed = false", parentFolderID)
+	pageToken := ""
+	count := 0
+
+	for {
+		resp, err := svc.Files.List().Q(query).
+			Fields("nextPageToken, files(id)").
+			PageToken(pageToken).
+			SupportsAllDrives(true).
+			Context(ctx).
+			Do()
+		if err != nil {
+			return "", err
+		}
+
+		count += len(resp.Files)
+		if resp.NextPageToken == "" {
+			break
+		}
+		pageToken = resp.NextPageToken
+	}
+
+	return fmt.Sprintf("Application_%03d", count+1), nil
+}
+
+func createDriveFolder(ctx context.Context, svc *drive.Service, folderName, parentFolderID string) (*drive.File, error) {
+	folder := &drive.File{
+		Name:     folderName,
+		MimeType: "application/vnd.google-apps.folder",
+		Parents:  []string{parentFolderID},
+	}
+
+	return svc.Files.Create(folder).
+		Fields("id").
+		SupportsAllDrives(true).
+		Context(ctx).
+		Do()
+}
+
+func uploadDriveFile(ctx context.Context, svc *drive.Service, name, mimeType, parentFolderID string, content io.Reader) (*drive.File, error) {
+	driveFile := &drive.File{
+		Name:    name,
+		Parents: []string{parentFolderID},
+	}
+
+	file, err := svc.Files.Create(driveFile).
+		Media(content).
+		Fields("id, webViewLink").
+		SupportsAllDrives(true).
+		Context(ctx).
+		Do()
+	if err != nil {
+		return nil, err
+	}
+
+	return file, nil
+}
+
+func appendApplicationRow(ctx context.Context, svc *sheets.Service, spreadsheetID string, app Applications) error {
+	sheetRange := strings.TrimSpace(os.Getenv("GOOGLE_SHEET_RANGE"))
+	if sheetRange == "" {
+		sheetRange = "Sheet1!A:I"
+	}
+
+	values := []interface{}{
+		app.Leader,
+		app.Email,
+		app.Phone,
+		app.Department,
+		app.Idea,
+		app.Track,
+		app.Sector,
+		app.PDFLink,
+		app.SubmittedAt,
+	}
+
+	valueRange := &sheets.ValueRange{Values: [][]interface{}{values}}
+
+	_, err := svc.Spreadsheets.Values.Append(spreadsheetID, sheetRange, valueRange).
+		ValueInputOption("RAW").
+		InsertDataOption("INSERT_ROWS").
+		Context(ctx).
+		Do()
+	return err
+}
+
+func wordCount(value string) int {
+	return len(strings.Fields(value))
 }

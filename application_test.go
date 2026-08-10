@@ -5,25 +5,6 @@ import (
 	"testing"
 )
 
-func TestParseRecipientsSupportsCommaSeparatedEmails(t *testing.T) {
-	recipients := parseRecipients("admin@example.com, team@example.com")
-
-	if len(recipients) != 2 {
-		t.Fatalf("expected 2 recipients, got %d", len(recipients))
-	}
-
-	if recipients[0] != "admin@example.com" || recipients[1] != "team@example.com" {
-		t.Fatalf("unexpected recipients: %v", recipients)
-	}
-}
-
-func TestResolveFromAddressFallsBackToResendSandbox(t *testing.T) {
-	got := resolveFromAddress("")
-	if got != resendSandboxFrom {
-		t.Fatalf("expected fallback sender %q, got %q", resendSandboxFrom, got)
-	}
-}
-
 func TestValidateApplicationRequiresDescriptionAndBaseFields(t *testing.T) {
 	app := Applications{
 		Idea:        "Smart app",
