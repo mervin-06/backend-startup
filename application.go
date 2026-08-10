@@ -4,16 +4,16 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
-
-	"github.com/jung-kurt/gofpdf"
-	"gopkg.in/gomail.v2"
+	"time"
 )
 
 type Applications struct {
@@ -28,12 +28,19 @@ type Applications struct {
 	Description string   `json:"description"`
 }
 
-type Response struct {
-	Status  string `json:"status"`
+type apiResponse struct {
+	Success bool   `json:"success"`
 	Message string `json:"message"`
 }
 
-func writeJSON(w http.ResponseWriter, status int, response Response) {
+const (
+	maxUploadSize = 10 << 20 // 10 MB
+	maxMemory     = 8 << 20  // 8 MB in memory for multipart form parsing
+	resendAPIURL  = "https://api.resend.com/emails"
+	defaultFrom   = "Startup Portal <onboarding@resend.dev>"
+)
+
+func writeJSON(w http.ResponseWriter, status int, response apiResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 
@@ -44,95 +51,126 @@ func writeJSON(w http.ResponseWriter, status int, response Response) {
 
 func Health(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
-		writeJSON(w, http.StatusNotFound, Response{
-			Status:  "error",
-			Message: "route not found",
-		})
+		writeJSON(w, http.StatusNotFound, apiResponse{Success: false, Message: "route not found"})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, Response{
-		Status:  "success",
-		Message: "Startup server is running",
-	})
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Startup server is running"})
 }
 
 func Application(w http.ResponseWriter, r *http.Request) {
-
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-
-		writeJSON(w, http.StatusMethodNotAllowed, Response{
-			Status:  "error",
-			Message: "method not allowed",
-		})
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Success: false, Message: "method not allowed"})
 		return
 	}
 
-	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	if err := r.ParseMultipartForm(maxMemory); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			writeJSON(w, http.StatusRequestEntityTooLarge, apiResponse{Success: false, Message: "uploaded file is too large"})
+			return
+		}
 
-	var app Applications
+		writeJSON(w, http.StatusBadRequest, apiResponse{Success: false, Message: "failed to parse multipart form data"})
+		return
+	}
 
-	err := json.NewDecoder(r.Body).Decode(&app)
+	app, pdfBytes, err := parseApplicationRequest(r.MultipartForm)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, Response{
-			Status:  "error",
-			Message: "invalid JSON",
-		})
+		writeJSON(w, http.StatusBadRequest, apiResponse{Success: false, Message: err.Error()})
 		return
 	}
 
 	if err := validateApplication(app); err != nil {
-		writeJSON(w, http.StatusBadRequest, Response{
-			Status:  "error",
-			Message: err.Error(),
-		})
+		writeJSON(w, http.StatusBadRequest, apiResponse{Success: false, Message: err.Error()})
 		return
 	}
 
-	// Generate PDF
-	pdfPath, err := GeneratePDF(app)
-	if err != nil {
-		log.Printf("generate PDF: %v", err)
-
-		writeJSON(w, http.StatusInternalServerError, Response{
-			Status:  "error",
-			Message: "failed to generate application PDF",
-		})
-		return
-	}
-
-	// Delete temporary PDF after request finishes
-	defer os.Remove(pdfPath)
-
-	// Send email
-	err = SendEmail(app, pdfPath)
-
-	if err != nil {
-
+	if err := SendEmail(app, pdfBytes); err != nil {
+		log.Printf("send email: %v", err)
 		if isEmailConfigurationError(err) {
-			log.Printf("email configuration error: %v", err)
-
-			writeJSON(w, http.StatusInternalServerError, Response{
-				Status:  "error",
-				Message: "email service is not configured on the server",
-			})
+			writeJSON(w, http.StatusInternalServerError, apiResponse{Success: false, Message: "email service is not configured on the server"})
 			return
 		}
 
-		log.Printf("send email: %v", err)
-
-		writeJSON(w, http.StatusInternalServerError, Response{
-			Status:  "error",
-			Message: "failed to send email",
-		})
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Success: false, Message: "Application received but email could not be sent"})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, Response{
-		Status:  "success",
-		Message: "application submitted successfully",
-	})
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Application submitted and email sent successfully"})
+}
+
+func parseApplicationRequest(form *multipart.Form) (Applications, []byte, error) {
+	getValue := func(key string) string {
+		if values, ok := form.Value[key]; ok && len(values) > 0 {
+			return strings.TrimSpace(values[0])
+		}
+		return ""
+	}
+
+	app := Applications{
+		Idea:        getValue("idea"),
+		Leader:      getValue("leader"),
+		Email:       getValue("email"),
+		Phone:       getValue("phone"),
+		Department:  getValue("department"),
+		Track:       getValue("track"),
+		Sector:      getValue("sector"),
+		Description: getValue("description"),
+	}
+
+	for _, team := range form.Value["teams"] {
+		trimmed := strings.TrimSpace(team)
+		if trimmed != "" {
+			app.Teams = append(app.Teams, trimmed)
+		}
+	}
+
+	files := form.File["applicationPDF"]
+	if len(files) == 0 {
+		return Applications{}, nil, errors.New("application PDF file is required")
+	}
+
+	fileHeader := files[0]
+	if fileHeader.Size > maxUploadSize {
+		return Applications{}, nil, errors.New("uploaded PDF exceeds size limit")
+	}
+
+	if !isPDFFile(fileHeader) {
+		return Applications{}, nil, errors.New("uploaded file must be a PDF")
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return Applications{}, nil, fmt.Errorf("open uploaded PDF: %w", err)
+	}
+	defer file.Close()
+
+	pdfBytes, err := io.ReadAll(file)
+	if err != nil {
+		return Applications{}, nil, fmt.Errorf("read uploaded PDF: %w", err)
+	}
+
+	if len(pdfBytes) == 0 {
+		return Applications{}, nil, errors.New("uploaded PDF file is empty")
+	}
+
+	if len(pdfBytes) > maxUploadSize {
+		return Applications{}, nil, errors.New("uploaded PDF exceeds size limit")
+	}
+
+	return app, pdfBytes, nil
+}
+
+func isPDFFile(header *multipart.FileHeader) bool {
+	contentType := strings.ToLower(header.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "pdf") {
+		return true
+	}
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	return ext == ".pdf"
 }
 
 func validateApplication(app Applications) error {
@@ -144,13 +182,13 @@ func validateApplication(app Applications) error {
 		strings.TrimSpace(app.Track) == "" ||
 		strings.TrimSpace(app.Sector) == "" ||
 		strings.TrimSpace(app.Description) == "" ||
-		len(app.Teams) != 3 {
+		len(app.Teams) == 0 {
 		return fmt.Errorf("all application fields are required")
 	}
 
 	for _, member := range app.Teams {
 		if strings.TrimSpace(member) == "" {
-			return fmt.Errorf("three team member names are required")
+			return fmt.Errorf("team member names cannot be empty")
 		}
 	}
 
@@ -161,406 +199,73 @@ func validateApplication(app Applications) error {
 	return nil
 }
 
-func GeneratePDF(app Applications) (string, error) {
-
-	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.AddPage()
-
-	// =========================
-	// HEADER
-	// =========================
-
-	pdf.SetFillColor(41, 128, 185)
-	pdf.SetTextColor(255, 255, 255)
-	pdf.SetFont("Arial", "B", 20)
-
-	pdf.CellFormat(
-		190,
-		15,
-		"STARTUP APPLICATION",
-		"",
-		1,
-		"C",
-		true,
-		0,
-		"",
-	)
-
-	pdf.Ln(8)
-
-	// =========================
-	// APPLICANT DETAILS
-	// =========================
-
-	pdf.SetTextColor(0, 0, 0)
-	pdf.SetFillColor(230, 240, 255)
-
-	pdf.SetFont("Arial", "B", 14)
-
-	pdf.CellFormat(
-		190,
-		10,
-		"Applicant Details",
-		"",
-		1,
-		"L",
-		true,
-		0,
-		"",
-	)
-
-	pdf.SetFont("Arial", "", 12)
-
-	pdf.Cell(45, 8, "Leader")
-	pdf.Cell(0, 8, app.Leader)
-	pdf.Ln(8)
-
-	pdf.Cell(45, 8, "Email")
-	pdf.Cell(0, 8, app.Email)
-	pdf.Ln(8)
-
-	pdf.Cell(45, 8, "Phone")
-	pdf.Cell(0, 8, app.Phone)
-	pdf.Ln(8)
-
-	pdf.Cell(45, 8, "Department")
-	pdf.Cell(0, 8, app.Department)
-	pdf.Ln(12)
-
-	// =========================
-	// STARTUP DETAILS
-	// =========================
-
-	pdf.SetFillColor(230, 240, 255)
-	pdf.SetFont("Arial", "B", 14)
-
-	pdf.CellFormat(
-		190,
-		10,
-		"Startup Details",
-		"",
-		1,
-		"L",
-		true,
-		0,
-		"",
-	)
-
-	pdf.SetFont("Arial", "", 12)
-
-	pdf.Cell(45, 8, "Idea")
-
-	// MultiCell allows long ideas
-	pdf.MultiCell(
-		145,
-		8,
-		app.Idea,
-		"",
-		"L",
-		false,
-	)
-
-	pdf.Ln(2)
-
-	pdf.Cell(45, 8, "Track")
-	pdf.Cell(0, 8, app.Track)
-	pdf.Ln(8)
-
-	pdf.Cell(45, 8, "Sector")
-	pdf.Cell(0, 8, app.Sector)
-	pdf.Ln(10)
-
-	pdf.SetFont("Arial", "B", 12)
-	pdf.Cell(45, 8, "Description")
-	pdf.SetFont("Arial", "", 12)
-	pdf.MultiCell(145, 8, app.Description, "", "L", false)
-	pdf.Ln(6)
-
-	// =========================
-	// TEAM MEMBERS
-	// =========================
-
-	pdf.SetFillColor(230, 240, 255)
-	pdf.SetFont("Arial", "B", 14)
-
-	pdf.CellFormat(
-		190,
-		10,
-		"Team Members",
-		"",
-		1,
-		"L",
-		true,
-		0,
-		"",
-	)
-
-	pdf.SetFont("Arial", "", 12)
-
-	if len(app.Teams) == 0 {
-
-		pdf.Cell(0, 8, "No additional team members")
-		pdf.Ln(8)
-
-	} else {
-
-		for _, member := range app.Teams {
-
-			member = strings.TrimSpace(member)
-
-			if member == "" {
-				continue
-			}
-
-			pdf.Cell(10, 8, "-")
-			pdf.Cell(0, 8, member)
-			pdf.Ln(8)
-		}
+func SendEmail(app Applications, pdfBytes []byte) error {
+	adminEmail := strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))
+	if adminEmail == "" {
+		return errors.New("email configuration is incomplete: ADMIN_EMAIL must be set")
 	}
 
-	// =========================
-	// FOOTER
-	// =========================
-
-	pdf.SetY(-20)
-
-	pdf.SetFont("Arial", "I", 10)
-	pdf.SetTextColor(120, 120, 120)
-
-	pdf.CellFormat(
-		190,
-		10,
-		"Generated by Startup Application Portal",
-		"",
-		0,
-		"C",
-		false,
-		0,
-		"",
-	)
-
-	// =========================
-	// CREATE TEMP PDF
-	// =========================
-
-	pdfFile, err := os.CreateTemp("", "startup-application-*.pdf")
-
-	if err != nil {
-		return "", fmt.Errorf("create PDF file: %w", err)
+	apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY"))
+	if apiKey == "" {
+		return errors.New("email configuration is incomplete: RESEND_API_KEY must be set")
 	}
 
-	pdfPath := pdfFile.Name()
-
-	if err := pdf.Output(pdfFile); err != nil {
-		pdfFile.Close()
-		os.Remove(pdfPath)
-
-		return "", fmt.Errorf("write PDF: %w", err)
-	}
-
-	if err := pdfFile.Close(); err != nil {
-		os.Remove(pdfPath)
-
-		return "", fmt.Errorf("close PDF: %w", err)
-	}
-
-	return pdfPath, nil
-}
-
-const resendSandboxFrom = "onboarding@resend.dev"
-
-func resolveFromAddress(from string) string {
-	from = strings.TrimSpace(from)
-	if from == "" {
-		return resendSandboxFrom
-	}
-
-	if strings.Contains(from, "<") || !strings.Contains(from, "@") {
-		return resendSandboxFrom
-	}
-
-	return fmt.Sprintf("Startup Portal <%s>", from)
-}
-
-func resolveSMTPFromAddress(from, smtpUser string) string {
-	from = strings.TrimSpace(from)
-	if from != "" && strings.Contains(from, "@") {
-		if strings.Contains(from, "<") {
-			return from
-		}
-		return fmt.Sprintf("Startup Portal <%s>", from)
-	}
-
-	smtpUser = strings.TrimSpace(smtpUser)
-	if smtpUser != "" && strings.Contains(smtpUser, "@") {
-		return smtpUser
-	}
-
-	return ""
-}
-
-func parseRecipients(value string) []string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil
-	}
-
-	parts := strings.FieldsFunc(value, func(r rune) bool {
-		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
-	})
-
-	var recipients []string
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed == "" {
-			continue
-		}
-		recipients = append(recipients, trimmed)
-	}
-
-	return recipients
-}
-
-func SendEmail(app Applications, pdfPath string) error {
-	admin := strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))
-	from := strings.TrimSpace(os.Getenv("FROM_EMAIL"))
-
-	adminRecipients := parseRecipients(admin)
-	if len(adminRecipients) == 0 {
-		return fmt.Errorf("email configuration is incomplete: ADMIN_EMAIL must be set")
-	}
-
-	log.Printf("SendEmail: admin=%q, from=%q", adminRecipients, from)
-
-	pdfBytes, err := os.ReadFile(pdfPath)
-	if err != nil {
-		return fmt.Errorf("read PDF: %w", err)
+	from := strings.TrimSpace(os.Getenv("SENDER_EMAIL"))
+	if from == "" || !strings.Contains(from, "@") {
+		from = defaultFrom
 	}
 
 	body := fmt.Sprintf(
-		"A new startup application has been submitted.\n\nLeader: %s\nEmail: %s\nPhone: %s\nIdea: %s\nDescription: %s",
-		app.Leader, app.Email, app.Phone, app.Idea, app.Description,
+		"A new startup application has been submitted.\n\nVenture/Idea name: %s\nTeam leader: %s\nEmail: %s\nPhone: %s\nDepartment: %s\nTrack: %s\nSector: %s\n\nDescription:\n%s\n\nTeam members:\n%s",
+		app.Idea,
+		app.Leader,
+		app.Email,
+		app.Phone,
+		app.Department,
+		app.Track,
+		app.Sector,
+		app.Description,
+		strings.Join(app.Teams, "\n"),
 	)
 
-	subject := "New Startup Application"
-
-	apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY"))
-	smtpHost := strings.TrimSpace(os.Getenv("SMTP_HOST"))
-	smtpPort := strings.TrimSpace(os.Getenv("SMTP_PORT"))
-	smtpUser := strings.TrimSpace(os.Getenv("SMTP_USER"))
-	smtpPass := strings.TrimSpace(os.Getenv("SMTP_PASS"))
-	smtpConfigured := smtpHost != "" && smtpPort != "" && smtpUser != "" && smtpPass != ""
-
-	if apiKey != "" {
-		err = sendEmailWithResend(apiKey, from, adminRecipients, subject, body, pdfBytes)
-		if err == nil {
-			return nil
-		}
-
-		if smtpConfigured {
-			log.Printf("Resend failed, attempting SMTP fallback: %v", err)
-			smtpErr := sendEmailWithSMTP(smtpHost, smtpPort, smtpUser, smtpPass, from, adminRecipients, subject, body, pdfPath)
-			if smtpErr == nil {
-				return nil
-			}
-			return fmt.Errorf("resend failed: %w; smtp fallback failed: %v", err, smtpErr)
-		}
-
-		return err
-	}
-
-	if smtpConfigured {
-		return sendEmailWithSMTP(smtpHost, smtpPort, smtpUser, smtpPass, from, adminRecipients, subject, body, pdfPath)
-	}
-
-	return fmt.Errorf("email configuration is incomplete: RESEND_API_KEY or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS must be set")
+	subject := fmt.Sprintf("New Startup Application - %s", app.Idea)
+	return sendEmailWithResend(apiKey, from, adminEmail, subject, body, pdfBytes)
 }
 
-func sendEmailWithResend(apiKey, from string, recipients []string, subject, body string, pdfBytes []byte) error {
-	if from = resolveFromAddress(from); from == "" {
-		from = resendSandboxFrom
-	}
-
+func sendEmailWithResend(apiKey, from, recipient, subject, body string, pdfBytes []byte) error {
 	payload := map[string]any{
 		"from":    from,
-		"to":      recipients,
+		"to":      []string{recipient},
 		"subject": subject,
 		"text":    body,
 		"attachments": []map[string]string{
-			{"filename": "application.pdf", "content": base64.StdEncoding.EncodeToString(pdfBytes)},
+			{"filename": "startup_application.pdf", "content": base64.StdEncoding.EncodeToString(pdfBytes), "type": "application/pdf"},
 		},
 	}
 
-	reqBody, _ := json.Marshal(payload)
-	req, _ := http.NewRequest(http.MethodPost, "https://api.resend.com/emails", bytes.NewReader(reqBody))
+	reqBody, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal resend payload: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, resendAPIURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("create resend request: %w", err)
+	}
+
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		bodyStr := string(b)
-
-		if resp.StatusCode == 403 {
-			log.Printf("resend 403 response: %s", bodyStr)
-			if strings.Contains(bodyStr, "domain is not verified") || strings.Contains(bodyStr, "testing emails") {
-				if from != resendSandboxFrom {
-					log.Printf("retrying email with default resend sender %q", resendSandboxFrom)
-					payload["from"] = resendSandboxFrom
-					reqBody, _ = json.Marshal(payload)
-					req, _ = http.NewRequest(http.MethodPost, "https://api.resend.com/emails", bytes.NewReader(reqBody))
-					req.Header.Set("Authorization", "Bearer "+apiKey)
-					req.Header.Set("Content-Type", "application/json")
-
-					resp, err = http.DefaultClient.Do(req)
-					if err != nil {
-						return fmt.Errorf("send request after fallback: %w", err)
-					}
-					defer resp.Body.Close()
-
-					if resp.StatusCode >= 300 {
-						b, _ = io.ReadAll(resp.Body)
-						return fmt.Errorf("email configuration is incomplete: %s", string(b))
-					}
-					return nil
-				}
-				return fmt.Errorf("email configuration is incomplete: %s", bodyStr)
-			}
-			return fmt.Errorf("resend 403 forbidden: %s", bodyStr)
-		}
-
-		return fmt.Errorf("resend error (%d): %s", resp.StatusCode, bodyStr)
-	}
-
-	return nil
-}
-
-func sendEmailWithSMTP(host, port, user, pass, from string, recipients []string, subject, body string, pdfPath string) error {
-	fromAddress := resolveSMTPFromAddress(from, user)
-	if fromAddress == "" {
-		fromAddress = "Startup Portal <no-reply@startup-portal.local>"
-	}
-
-	portNum, err := strconv.Atoi(port)
-	if err != nil {
-		return fmt.Errorf("invalid SMTP_PORT: %w", err)
-	}
-
-	message := gomail.NewMessage()
-	message.SetHeader("From", fromAddress)
-	message.SetHeader("To", recipients...)
-	message.SetHeader("Subject", subject)
-	message.SetBody("text/plain", body)
-	message.Attach(pdfPath)
-
-	dialer := gomail.NewDialer(host, portNum, user, pass)
-	if err := dialer.DialAndSend(message); err != nil {
-		return fmt.Errorf("send email over SMTP: %w", err)
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("resend error (%d): %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
 	}
 
 	return nil
