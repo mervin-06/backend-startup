@@ -28,8 +28,13 @@ type Applications struct {
 	Track       string   `json:"track"`
 	Sector      string   `json:"sector"`
 	Description string   `json:"description"`
-	SubmittedAt string   `json:"submittedAt,omitempty"`
-	PDFLink     string   `json:"pdfLink,omitempty"`
+	// Parsed holds an optional mapping of parsed/unstructured descriptions
+	// mapped to existing fields. Each key maps to one or more original
+	// description strings. This is optional and will be stored with the
+	// application JSON saved to Drive.
+	Parsed      map[string][]string `json:"parsed,omitempty"`
+	SubmittedAt string              `json:"submittedAt,omitempty"`
+	PDFLink     string              `json:"pdfLink,omitempty"`
 }
 
 type apiResponse struct {
@@ -129,6 +134,18 @@ func parseApplicationRequest(form *multipart.Form) (Applications, []byte, error)
 		Track:       getValue("track"),
 		Sector:      getValue("sector"),
 		Description: getValue("description"),
+	}
+
+	// Optional parsed descriptions payload (JSON string) produced by the
+	// client. If present, attempt to unmarshal into app.Parsed. Do not
+	// fail the entire request if parsing fails; just log and continue.
+	if vals, ok := form.Value["parsedDescriptions"]; ok && len(vals) > 0 {
+		var parsed map[string][]string
+		if err := json.Unmarshal([]byte(vals[0]), &parsed); err != nil {
+			log.Printf("warning: unable to parse parsedDescriptions JSON: %v", err)
+		} else {
+			app.Parsed = parsed
+		}
 	}
 
 	for _, team := range form.Value["teams"] {
