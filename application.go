@@ -236,13 +236,22 @@ func uploadApplicationToDrive(ctx context.Context, app Applications, pdfBytes []
 	log.Printf("Encoding PDF to base64 (size=%d bytes)", len(pdfBytes))
 	b64 := base64.StdEncoding.EncodeToString(pdfBytes)
 
+	// Filenames based on sanitized leader name
+	baseName := sanitized
+	if baseName == "" {
+		baseName = "Application"
+	}
+	pdfFilename := fmt.Sprintf("%s.pdf", baseName)
+	jsonFilename := fmt.Sprintf("%s.json", baseName)
+
 	payload := map[string]interface{}{
 		"application": app,
 		"folderName":  folderName,
 		"pdf": map[string]string{
-			"filename": "application.pdf",
+			"filename": pdfFilename,
 			"base64":   b64,
 		},
+		"jsonFilename": jsonFilename,
 	}
 
 	bodyBytes, err := json.Marshal(payload)
