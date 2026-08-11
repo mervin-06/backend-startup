@@ -218,12 +218,27 @@ func uploadApplicationToDrive(ctx context.Context, app Applications, pdfBytes []
 
 	log.Printf("Preparing payload for Apps Script at %s", appsScriptURL)
 
+	// Build sanitized folder name using team leader and timestamp
+	leader := strings.TrimSpace(app.Leader)
+	sanitized := sanitizeFolderName(leader)
+	// Use submitted time if available, else now
+	ts := time.Now().UTC()
+	if app.SubmittedAt != "" {
+		if t, err := time.Parse(time.RFC3339, app.SubmittedAt); err == nil {
+			ts = t.UTC()
+		}
+	}
+	timeStamp := ts.Format("2006-01-02_1504") // e.g. 2026-08-11_1030
+	folderName := fmt.Sprintf("%s_%s", sanitized, timeStamp)
+	log.Printf("Using folder name: %s", folderName)
+
 	// Encode PDF to base64
 	log.Printf("Encoding PDF to base64 (size=%d bytes)", len(pdfBytes))
 	b64 := base64.StdEncoding.EncodeToString(pdfBytes)
 
 	payload := map[string]interface{}{
 		"application": app,
+		"folderName":  folderName,
 		"pdf": map[string]string{
 			"filename": "application.pdf",
 			"base64":   b64,
@@ -280,4 +295,31 @@ func uploadApplicationToDrive(ctx context.Context, app Applications, pdfBytes []
 
 func wordCount(value string) int {
 	return len(strings.Fields(value))
+}
+
+// sanitizeFolderName replaces characters not allowed or problematic in Drive folder names
+func sanitizeFolderName(name string) string {
+	if name == "" {
+		return "Application"
+	}
+	// Replace any character that is not alphanumeric, space, hyphen or underscore with underscore
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ' ' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	s := strings.TrimSpace(b.String())
+	// Replace spaces with underscores
+	s = strings.ReplaceAll(s, " ", "_")
+	if s == "" {
+		return "Application"
+	}
+	// limit length
+	if len(s) > 100 {
+		return s[:100]
+	}
+	return s
 }
