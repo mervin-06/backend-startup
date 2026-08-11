@@ -1,12 +1,13 @@
 package main
 
 import (
-	"github.com/joho/godotenv"
-	"github.com/rs/cors"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/joho/godotenv"
+	"github.com/rs/cors"
 )
 
 func isAllowedOrigin(origin string) bool {
@@ -25,8 +26,9 @@ func isAllowedOrigin(origin string) bool {
 		"http://localhost:5173",
 		"http://127.0.0.1:5173",
 
-		// Netlify frontend
-		"https://startup-client-gilt.vercel.app/",
+		// Frontend applications
+		"https://startup-client.netlify.app",
+		"https://startup-client-gilt.vercel.app",
 	}
 
 	for _, allowed := range allowedOrigins {

@@ -22,7 +22,12 @@ func TestIsAllowedOriginAllowsLocalhostAndLoopback(t *testing.T) {
 			want:   true,
 		},
 		{
-			name:   "production client",
+			name:   "production client (Vercel)",
+			origin: "https://startup-client-gilt.vercel.app",
+			want:   true,
+		},
+		{
+			name:   "production client (Netlify)",
 			origin: "https://startup-client.netlify.app",
 			want:   true,
 		},
