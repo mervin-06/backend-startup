@@ -1,12 +1,12 @@
 package main
 
 import (
+	"github.com/joho/godotenv"
+	"github.com/rs/cors"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-	"github.com/joho/godotenv"
-	"github.com/rs/cors"
 )
 
 func isAllowedOrigin(origin string) bool {
@@ -51,13 +51,12 @@ func isAllowedOrigin(origin string) bool {
 
 func main() {
 
-// Load .env file (only affects local dev; Render uses its own env vars)
+	// Load .env file (only affects local dev; Render uses its own env vars)
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system environment variables")
 	}
 
 	mux := http.NewServeMux()
-
 
 	// Routes
 	mux.HandleFunc("/", Health)
