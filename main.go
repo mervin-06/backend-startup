@@ -26,7 +26,7 @@ func isAllowedOrigin(origin string) bool {
 		"http://127.0.0.1:5173",
 
 		// Netlify frontend
-		"https://startup-client.netlify.app",
+		"https://startup-client-gilt.vercel.app/",
 	}
 
 	for _, allowed := range allowedOrigins {
